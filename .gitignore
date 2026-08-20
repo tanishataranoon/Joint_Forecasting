@@ -1,0 +1,37 @@
+# Data (transfer via Drive/USB, not git)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Checkpoints and outputs (transfer via Drive/USB, not git)
+checkpoints/*
+!checkpoints/.gitkeep
+outputs/*
+!outputs/.gitkeep
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.egg-info/
+.venv/
+venv/
+env/
+venv_cuda/
+.env
+__pycache__/
+*.pyc
+
+# Earth Engine credentials cache
+.config/earthengine/
+
+# OS
+.DS_Store
+
+venv_cuda/
+.env
+__pycache__/

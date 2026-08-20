@@ -1,0 +1,229 @@
+# Central configuration for the compound drought/heat-stress
+# forecasting thesis.
+
+project:
+  seed: 42
+  gee_project_id: null   # loaded from GEE_PROJECT_ID in .env
+
+
+# ======================================================================
+# STUDY AREA
+# ======================================================================
+
+study_area:
+  start_date: "2010-01-01"
+  end_date: "2026-06-30"
+
+  districts:
+    Rajshahi: {lat: 24.3745, lon: 88.6042}
+    Naogaon: {lat: 24.7936, lon: 88.9318}
+    Natore: {lat: 24.4206, lon: 88.9854}
+    Nawabganj: {lat: 24.5965, lon: 88.2775}
+    Pabna: {lat: 24.0064, lon: 89.2372}
+
+  district_point_offset: 0.15
+
+
+# ======================================================================
+# DATA
+# ======================================================================
+
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+
+  # Generated automatically by scripts/build_dataset.py
+  nasa_power_raw: "data/raw/nasa_power_raw.csv"
+  modis_raw: "data/raw/modis_raw.csv"
+  merged_raw: "data/raw/merged_raw.csv"
+
+  cleaned_data: "data/processed/cleaned_data.csv"
+  final_dataset: "data/processed/final_dataset.csv"
+
+
+# ======================================================================
+# QUALITY CONTROL
+# ======================================================================
+
+qc:
+  physical_limits:
+    T2M: [-5, 50]
+    T2M_MAX: [-5, 55]
+    T2M_MIN: [-10, 45]
+    RH2M: [0, 100]
+    PRECTOTCORR: [0, 500]
+    WS2M: [0, 50]
+    ALLSKY_SFC_SW_DWN: [0, 40]
+
+  iqr_k: 3.0
+
+  gap_fill:
+    short_max: 3
+    medium_max: 15
+    very_long_min: 90
+
+
+# ======================================================================
+# FEATURES
+# ======================================================================
+
+features:
+
+  # --------------------------------------------------
+  # Meteorological observations
+  # --------------------------------------------------
+
+  meteorological:
+    - T2M
+    - T2M_MAX
+    - T2M_MIN
+    - RH2M
+    - PRECTOTCORR
+    - ALLSKY_SFC_SW_DWN
+    - WS2M
+
+
+  # --------------------------------------------------
+  # Vegetation / land-surface observations
+  # --------------------------------------------------
+
+  vegetation:
+    - NDVI
+    - LST
+
+
+  # --------------------------------------------------
+  # Engineered agro-climatic features
+  # --------------------------------------------------
+
+  engineered:
+    - VPD
+    - Humidex
+    - SPI3
+    - doy_sin
+    - doy_cos
+
+
+  # --------------------------------------------------
+  # Forecast targets
+  # --------------------------------------------------
+
+  target_regression:
+    - SPI3
+    - Humidex
+
+  target_classification:
+    - drought_target_7d
+    - heat_target_7d
+
+
+  # --------------------------------------------------
+  # Conventional SPI-3
+  #
+  # SPI-3 = 3-month precipitation accumulation.
+  # No daily 90-day rolling window is used.
+  # --------------------------------------------------
+
+  spi_timescale_months: 3
+
+
+# ======================================================================
+# SEQUENCE / FORECASTING
+# ======================================================================
+
+sequence:
+
+  # Number of historical observations provided to the
+  # temporal model.
+  #
+  # 30 days means:
+  #
+  # t-29 ... t-1 ... t
+  #              ↓
+  #          forecast
+  #              ↓
+  #             t+7
+  #
+  window: 30
+
+  # Forecast horizon in DAYS.
+  horizon: 7
+
+
+# ======================================================================
+# CHRONOLOGICAL DATA SPLIT
+# ======================================================================
+
+split:
+
+  # Split according to the TARGET DATE.
+  #
+  # 2010-2022 → training
+  # 2023-2024 → validation
+  # 2025-2026 → testing
+
+  train_years: [2010, 2022]
+
+  val_years: [2023, 2024]
+
+  test_years: [2025, 2026]
+
+
+# ======================================================================
+# MODEL
+# ======================================================================
+
+model:
+  d_model: 128
+  d_k: 32
+  num_heads: 4
+  gate_hidden: 64
+  dropout: 0.1
+
+  # Which temporal backbone to use after AdaptiveCrossAttentionFusion.
+  # Swap this for the ablation study (Section T of the plan) without
+  # touching any code -- train.py reads this and builds the matching
+  # class from src/models/temporal_backbones/.
+  backbone: bilstm_attention   # one of: bilstm_attention, cnn_bilstm_attention, tft
+
+  backbones:
+    bilstm_attention:
+      hidden_dim: 128
+      num_layers: 1
+    cnn_bilstm_attention:
+      cnn_channels: 128
+      kernel_sizes: [3, 5]     # ~3-day and ~5-day local patterns before the BiLSTM
+      hidden_dim: 128
+      num_layers: 1
+    tft:
+      hidden_dim: 128
+      num_heads: 4             # interpretable multi-head attention (shared value projection)
+
+  # Multi-task loss weights (Section O of the plan). Equal weighting is
+  # the current default -- revisit once you see per-task loss curves;
+  # if one task dominates the combined loss, its lambda should drop.
+  loss_weights:
+    regression: 1.0
+    drought: 1.0
+    heat: 1.0
+
+
+# ======================================================================
+# TRAINING
+# ======================================================================
+
+train:
+  batch_size: 64
+  epochs: 100
+  lr: 0.001
+  early_stopping_patience: 10
+  checkpoint_dir: "checkpoints"
+
+
+# ======================================================================
+# ADVISORY SYSTEM
+# ======================================================================
+
+advisory:
+  gemini_model: "gemini-2.5-flash"
+  guideline_kb_path: "src/advisory_guideline_kb.json"
