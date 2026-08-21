@@ -178,7 +178,7 @@ model:
   d_k: 32
   num_heads: 4
   gate_hidden: 64
-  dropout: 0.1
+  dropout: 0.25
 
   # Which temporal backbone to use after AdaptiveCrossAttentionFusion.
   # Swap this for the ablation study (Section T of the plan) without
@@ -204,8 +204,8 @@ model:
   # if one task dominates the combined loss, its lambda should drop.
   loss_weights:
     regression: 1.0
-    drought: 1.0
-    heat: 1.0
+    drought: 0.7
+    heat: 0.7
 
 
 # ======================================================================
@@ -215,8 +215,8 @@ model:
 train:
   batch_size: 64
   epochs: 100
-  lr: 0.001
-  early_stopping_patience: 10
+  lr: 0.0001
+  early_stopping_patience: 5
   checkpoint_dir: "checkpoints"
 
 

@@ -37,13 +37,24 @@ Testing:
 The split is chronological and is performed using target dates.
 """
 
-from logging import config
+# ======================================================================
+# IMPORTS
+# ======================================================================
+
+import random
 import sys
 from pathlib import Path
 
-# ----------------------------------------------------------------------
-# Make project root importable when this file is executed directly.
-# ----------------------------------------------------------------------
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import yaml
+
+
+# ======================================================================
+# PROJECT ROOT
+# ======================================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
@@ -51,13 +62,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-import random
-
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-import yaml
+# ======================================================================
+# PROJECT IMPORTS
+# ======================================================================
 
 from src.dataset import (
     create_sequences,
@@ -81,6 +88,7 @@ from src.models.heads import MultiTaskHeads
 # REPRODUCIBILITY
 # ======================================================================
 
+
 def set_seed(seed: int = 42):
     """
     Set random seeds for reproducible training.
@@ -103,6 +111,7 @@ def set_seed(seed: int = 42):
 # ======================================================================
 # CONFIGURATION
 # ======================================================================
+
 
 def load_config(config_path: str = "configs/config.yaml"):
     """
@@ -131,6 +140,7 @@ def load_config(config_path: str = "configs/config.yaml"):
 # COMPLETE BILSTM MODEL
 # ======================================================================
 
+
 class BiLSTMForecastModel(nn.Module):
     """
     Complete forecasting model for the BiLSTM + Attention experiment.
@@ -154,9 +164,9 @@ class BiLSTMForecastModel(nn.Module):
         num_heads: int,
         gate_hidden: int,
         fusion_dropout: float,
-        lstm_hidden: int = 128,
+        lstm_hidden: int = 64,
         lstm_layers: int = 1,
-        head_dropout: float = 0.1,
+        head_dropout: float = 0.30,
     ):
         super().__init__()
 
@@ -185,6 +195,7 @@ class BiLSTMForecastModel(nn.Module):
             num_layers=lstm_layers,
             dropout=fusion_dropout,
         )
+        self.temporal_dropout = nn.Dropout(p=0.3)
 
         # --------------------------------------------------------------
         # Multi-task heads
@@ -244,17 +255,18 @@ class BiLSTMForecastModel(nn.Module):
         # --------------------------------------------------------------
 
         temporal_output = self.temporal_backbone(fused)
-
         pooled = temporal_output["pooled"]
+
+        pooled = self.temporal_dropout(pooled)
+
         temporal_attention = temporal_output["temporal_attn"]
+        reg_out, drought_logits, heat_logits = self.heads(pooled)
 
         # --------------------------------------------------------------
         # 3. Multi-task prediction heads
         # --------------------------------------------------------------
 
-        reg_out, drought_logits, heat_logits = self.heads(
-            pooled
-        )
+        reg_out, drought_logits, heat_logits = self.heads(pooled)
 
         return {
             "fused": fused,
@@ -269,23 +281,24 @@ class BiLSTMForecastModel(nn.Module):
 
 
 # ======================================================================
-# LOSS
+# MULTI-TASK LOSS
 # ======================================================================
+
 
 class MultiTaskLoss(nn.Module):
     """
-    Combined loss:
+    Combined multi-task loss:
 
         total =
-            regression_loss
-            + drought_classification_loss
-            + heat_classification_loss
+            regression_weight * regression_loss
+            + drought_weight * drought_classification_loss
+            + heat_weight * heat_classification_loss
 
     Regression:
         MSE
 
     Classification:
-        CrossEntropyLoss
+        Weighted CrossEntropyLoss
     """
 
     def __init__(
@@ -293,6 +306,8 @@ class MultiTaskLoss(nn.Module):
         regression_weight: float = 1.0,
         drought_weight: float = 1.0,
         heat_weight: float = 1.0,
+        drought_class_weights: torch.Tensor = None,
+        heat_class_weights: torch.Tensor = None,
     ):
         super().__init__()
 
@@ -300,11 +315,27 @@ class MultiTaskLoss(nn.Module):
         self.drought_weight = drought_weight
         self.heat_weight = heat_weight
 
+        # --------------------------------------------------------------
+        # Regression
+        # --------------------------------------------------------------
+
         self.regression_loss = nn.MSELoss()
 
-        self.drought_loss = nn.CrossEntropyLoss()
+        # --------------------------------------------------------------
+        # Drought classification
+        # --------------------------------------------------------------
 
-        self.heat_loss = nn.CrossEntropyLoss()
+        self.drought_loss = nn.CrossEntropyLoss(
+            weight=drought_class_weights
+        )
+
+        # --------------------------------------------------------------
+        # Heat classification
+        # --------------------------------------------------------------
+
+        self.heat_loss = nn.CrossEntropyLoss(
+            weight=heat_class_weights
+        )
 
     def forward(
         self,
@@ -313,14 +344,19 @@ class MultiTaskLoss(nn.Module):
         y_cls,
     ):
         """
+        Parameters
+        ----------
+        outputs:
+            Model output dictionary.
+
         y_reg:
             (B, 2)
 
         y_cls:
             (B, 2)
 
-        y_cls[:, 0] = drought class
-        y_cls[:, 1] = heat class
+            y_cls[:, 0] = drought class
+            y_cls[:, 1] = heat class
         """
 
         reg_out = outputs["reg_out"]
@@ -379,8 +415,145 @@ class MultiTaskLoss(nn.Module):
 
 
 # ======================================================================
+# CLASS WEIGHTS
+# ======================================================================
+
+
+def compute_class_weights(
+    y_cls: np.ndarray,
+    n_classes: int = 4,
+):
+    """
+    Compute balanced class weights from TRAINING labels only.
+
+    Weight for class c:
+
+        weight_c = N / (K * N_c)
+
+    where:
+
+        N   = total number of training samples
+        K   = number of classes
+        N_c = number of training samples belonging to class c
+
+    Parameters
+    ----------
+    y_cls:
+        Classification targets with shape (N, 2).
+
+        Column 0 = drought class
+        Column 1 = heat class
+
+    n_classes:
+        Number of classes.
+
+    Returns
+    -------
+    drought_weights:
+        Tensor of shape (n_classes,)
+
+    heat_weights:
+        Tensor of shape (n_classes,)
+    """
+
+    def calculate_single_weights(targets):
+
+        targets = np.asarray(targets).astype(np.int64)
+
+        counts = np.bincount(
+            targets,
+            minlength=n_classes,
+        )
+
+        total = len(targets)
+
+        weights = np.zeros(
+            n_classes,
+            dtype=np.float32,
+        )
+
+        for class_id in range(n_classes):
+
+            if counts[class_id] > 0:
+
+                weights[class_id] = (
+                    total
+                    / (n_classes * counts[class_id])
+                )
+
+            else:
+
+                weights[class_id] = 0.0
+
+        return weights, counts
+
+    # --------------------------------------------------------------
+    # Drought
+    # --------------------------------------------------------------
+
+    drought_weights, drought_counts = calculate_single_weights(
+        y_cls[:, 0]
+    )
+
+    # --------------------------------------------------------------
+    # Heat
+    # --------------------------------------------------------------
+
+    heat_weights, heat_counts = calculate_single_weights(
+        y_cls[:, 1]
+    )
+
+    # --------------------------------------------------------------
+    # Print
+    # --------------------------------------------------------------
+
+    print()
+    print("=" * 78)
+    print("TRAINING-ONLY CLASS WEIGHTS")
+    print("=" * 78)
+
+    print()
+    print("DROUGHT")
+    print("-" * 78)
+
+    for class_id in range(n_classes):
+
+        print(
+            f"  Class {class_id}: "
+            f"count={drought_counts[class_id]:,} | "
+            f"weight={drought_weights[class_id]:.6f}"
+        )
+
+    print()
+    print("HEAT")
+    print("-" * 78)
+
+    for class_id in range(n_classes):
+
+        print(
+            f"  Class {class_id}: "
+            f"count={heat_counts[class_id]:,} | "
+            f"weight={heat_weights[class_id]:.6f}"
+        )
+
+    print("=" * 78)
+
+    return (
+        torch.tensor(
+            drought_weights,
+            dtype=torch.float32,
+        ),
+        torch.tensor(
+            heat_weights,
+            dtype=torch.float32,
+        ),
+    )
+
+
+# ======================================================================
 # ONE TRAINING EPOCH
 # ======================================================================
+
 
 def train_one_epoch(
     model,
@@ -389,6 +562,7 @@ def train_one_epoch(
     optimizer,
     device,
 ):
+
     model.train()
 
     total_loss = 0.0
@@ -406,6 +580,10 @@ def train_one_epoch(
         y_cls,
     ) in loader:
 
+        # --------------------------------------------------------------
+        # Move to device
+        # --------------------------------------------------------------
+
         x_met = x_met.to(device)
         x_veg = x_veg.to(device)
         x_eng = x_eng.to(device)
@@ -417,7 +595,7 @@ def train_one_epoch(
         # Clear gradients
         # --------------------------------------------------------------
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         # --------------------------------------------------------------
         # Forward
@@ -460,12 +638,27 @@ def train_one_epoch(
 
         optimizer.step()
 
+        # --------------------------------------------------------------
+        # Accumulate
+        # --------------------------------------------------------------
+
         batch_size = x_met.size(0)
 
-        total_loss += losses["total"].item() * batch_size
-        total_reg += losses["regression"].item() * batch_size
-        total_drought += losses["drought"].item() * batch_size
-        total_heat += losses["heat"].item() * batch_size
+        total_loss += (
+            losses["total"].item() * batch_size
+        )
+
+        total_reg += (
+            losses["regression"].item() * batch_size
+        )
+
+        total_drought += (
+            losses["drought"].item() * batch_size
+        )
+
+        total_heat += (
+            losses["heat"].item() * batch_size
+        )
 
         total_samples += batch_size
 
@@ -481,6 +674,7 @@ def train_one_epoch(
 # VALIDATION
 # ======================================================================
 
+
 @torch.no_grad()
 def validate_one_epoch(
     model,
@@ -488,6 +682,7 @@ def validate_one_epoch(
     criterion,
     device,
 ):
+
     model.eval()
 
     total_loss = 0.0
@@ -505,6 +700,10 @@ def validate_one_epoch(
         y_cls,
     ) in loader:
 
+        # --------------------------------------------------------------
+        # Move to device
+        # --------------------------------------------------------------
+
         x_met = x_met.to(device)
         x_veg = x_veg.to(device)
         x_eng = x_eng.to(device)
@@ -512,11 +711,19 @@ def validate_one_epoch(
         y_reg = y_reg.to(device)
         y_cls = y_cls.to(device)
 
+        # --------------------------------------------------------------
+        # Forward
+        # --------------------------------------------------------------
+
         outputs = model(
             x_met,
             x_veg,
             x_eng,
         )
+
+        # --------------------------------------------------------------
+        # Loss
+        # --------------------------------------------------------------
 
         losses = criterion(
             outputs,
@@ -524,12 +731,27 @@ def validate_one_epoch(
             y_cls,
         )
 
+        # --------------------------------------------------------------
+        # Accumulate
+        # --------------------------------------------------------------
+
         batch_size = x_met.size(0)
 
-        total_loss += losses["total"].item() * batch_size
-        total_reg += losses["regression"].item() * batch_size
-        total_drought += losses["drought"].item() * batch_size
-        total_heat += losses["heat"].item() * batch_size
+        total_loss += (
+            losses["total"].item() * batch_size
+        )
+
+        total_reg += (
+            losses["regression"].item() * batch_size
+        )
+
+        total_drought += (
+            losses["drought"].item() * batch_size
+        )
+
+        total_heat += (
+            losses["heat"].item() * batch_size
+        )
 
         total_samples += batch_size
 
@@ -545,6 +767,7 @@ def validate_one_epoch(
 # SAVE CHECKPOINT
 # ======================================================================
 
+
 def save_checkpoint(
     model,
     optimizer,
@@ -553,12 +776,13 @@ def save_checkpoint(
     val_loss,
     path,
 ):
-    """
-    Save the complete training state.
-    """
 
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     torch.save(
         {
@@ -576,24 +800,28 @@ def save_checkpoint(
 # MAIN
 # ======================================================================
 
+
 def main():
 
     print("=" * 78)
     print("BiLSTM + TEMPORAL ATTENTION TRAINING")
     print("=" * 78)
 
-    # ------------------------------------------------------------------
-    # Configuration
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # CONFIGURATION
+    # ==================================================================
 
-    config = load_config("configs/config.yaml")
+    config = load_config(
+        "configs/config.yaml"
+    )
+
     seed = config["project"]["seed"]
 
     set_seed(seed)
 
-    # ------------------------------------------------------------------
-    # Device
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # DEVICE
+    # ==================================================================
 
     device = torch.device(
         "cuda"
@@ -603,28 +831,44 @@ def main():
 
     print(f"Device: {device}")
 
-    # ------------------------------------------------------------------
-    # Configuration values
-    # ------------------------------------------------------------------
+    if device.type == "cuda":
+
+        print(
+            f"GPU: {torch.cuda.get_device_name(0)}"
+        )
+
+    # ==================================================================
+    # CONFIGURATION VALUES
+    # ==================================================================
 
     met_cols = config["features"]["meteorological"]
+
     veg_cols = config["features"]["vegetation"]
+
     eng_cols = config["features"]["engineered"]
 
     target_reg = config["features"]["target_regression"]
+
     target_cls = config["features"]["target_classification"]
 
     window = config["sequence"]["window"]
+
     horizon = config["sequence"]["horizon"]
 
     d_model = config["model"]["d_model"]
+
     d_k = config["model"]["d_k"]
+
     num_heads = config["model"]["num_heads"]
+
     gate_hidden = config["model"]["gate_hidden"]
+
     dropout = config["model"]["dropout"]
 
     batch_size = config["train"]["batch_size"]
+
     epochs = config["train"]["epochs"]
+
     learning_rate = config["train"]["lr"]
 
     patience = config["train"]["early_stopping_patience"]
@@ -633,56 +877,100 @@ def main():
         config["train"]["checkpoint_dir"]
     )
 
-    # ------------------------------------------------------------------
-    # Configuration summary
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # CONFIGURATION SUMMARY
+    # ==================================================================
 
     print()
     print("Configuration")
     print("-" * 78)
 
-    print(f"Meteorological features : {len(met_cols)}")
-    print(f"Vegetation features     : {len(veg_cols)}")
-    print(f"Engineered features     : {len(eng_cols)}")
+    print(
+        f"Meteorological features : {len(met_cols)}"
+    )
 
-    print(f"Window                  : {window}")
-    print(f"Horizon                 : {horizon} days")
+    print(
+        f"Vegetation features     : {len(veg_cols)}"
+    )
 
-    print(f"D_MODEL                 : {d_model}")
-    print(f"D_K                     : {d_k}")
-    print(f"Attention heads         : {num_heads}")
-    print(f"Gate hidden             : {gate_hidden}")
+    print(
+        f"Engineered features     : {len(eng_cols)}"
+    )
 
-    print(f"Batch size              : {batch_size}")
-    print(f"Maximum epochs          : {epochs}")
-    print(f"Learning rate           : {learning_rate}")
-    print(f"Early stopping patience : {patience}")
+    print(
+        f"Window                  : {window}"
+    )
+
+    print(
+        f"Horizon                 : {horizon} days"
+    )
+
+    print(
+        f"D_MODEL                 : {d_model}"
+    )
+
+    print(
+        f"D_K                     : {d_k}"
+    )
+
+    print(
+        f"Attention heads         : {num_heads}"
+    )
+
+    print(
+        f"Gate hidden             : {gate_hidden}"
+    )
+
+    print(
+        f"Batch size              : {batch_size}"
+    )
+
+    print(
+        f"Maximum epochs          : {epochs}"
+    )
+
+    print(
+        f"Learning rate           : {learning_rate}"
+    )
+
+    print(
+        f"Early stopping patience : {patience}"
+    )
 
     print("-" * 78)
 
-    # ------------------------------------------------------------------
-    # Load final dataset
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # LOAD DATASET
+    # ==================================================================
 
     dataset_path = Path(
         config["data"]["final_dataset"]
     )
 
+    if not dataset_path.is_absolute():
+        dataset_path = PROJECT_ROOT / dataset_path
+
     if not dataset_path.exists():
+
         raise FileNotFoundError(
             f"Final dataset not found:\n{dataset_path}"
         )
 
     print()
-    print(f"Loading dataset: {dataset_path}")
+    print(
+        f"Loading dataset: {dataset_path}"
+    )
 
-    df = pd.read_csv(dataset_path)
+    df = pd.read_csv(
+        dataset_path
+    )
 
-    # --------------------------------------------------------------
-    # Date conversion
-    # --------------------------------------------------------------
+    # ==================================================================
+    # DATE
+    # ==================================================================
 
     if "date" not in df.columns:
+
         raise KeyError(
             "Dataset does not contain required 'date' column."
         )
@@ -691,12 +979,17 @@ def main():
         df["date"]
     )
 
-    print(f"Rows loaded: {len(df):,}")
-    print(f"Columns: {len(df.columns)}")
+    print(
+        f"Rows loaded: {len(df):,}"
+    )
 
-    # ------------------------------------------------------------------
-    # Check required columns
-    # ------------------------------------------------------------------
+    print(
+        f"Columns: {len(df.columns)}"
+    )
+
+    # ==================================================================
+    # REQUIRED COLUMNS
+    # ==================================================================
 
     required_columns = (
         met_cols
@@ -704,7 +997,10 @@ def main():
         + eng_cols
         + target_reg
         + target_cls
-        + ["district", "date"]
+        + [
+            "district",
+            "date",
+        ]
     )
 
     missing_columns = [
@@ -714,17 +1010,20 @@ def main():
     ]
 
     if missing_columns:
+
         raise KeyError(
             "The following required columns are missing:\n"
             + "\n".join(missing_columns)
         )
 
-    # ------------------------------------------------------------------
-    # Create sliding windows
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # CREATE SLIDING WINDOWS
+    # ==================================================================
 
     print()
-    print("Creating sliding-window sequences...")
+    print(
+        "Creating sliding-window sequences..."
+    )
 
     (
         X_met,
@@ -745,18 +1044,34 @@ def main():
         horizon=horizon,
     )
 
-    print(f"Meteorological sequences : {X_met.shape}")
-    print(f"Vegetation sequences     : {X_veg.shape}")
-    print(f"Engineered sequences     : {X_eng.shape}")
-    print(f"Regression targets       : {y_reg.shape}")
-    print(f"Classification targets   : {y_cls.shape}")
+    print(
+        f"Meteorological sequences : {X_met.shape}"
+    )
 
-    # ------------------------------------------------------------------
-    # Chronological split
-    # ------------------------------------------------------------------
+    print(
+        f"Vegetation sequences     : {X_veg.shape}"
+    )
+
+    print(
+        f"Engineered sequences     : {X_eng.shape}"
+    )
+
+    print(
+        f"Regression targets       : {y_reg.shape}"
+    )
+
+    print(
+        f"Classification targets   : {y_cls.shape}"
+    )
+
+    # ==================================================================
+    # CHRONOLOGICAL SPLIT
+    # ==================================================================
 
     train_years = config["split"]["train_years"]
+
     val_years = config["split"]["val_years"]
+
     test_years = config["split"]["test_years"]
 
     (
@@ -789,9 +1104,9 @@ def main():
         f"{test_mask.sum():,} samples"
     )
 
-    # ------------------------------------------------------------------
-    # Extract splits
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # EXTRACT SPLITS
+    # ==================================================================
 
     train_arrays = subset_arrays(
         train_mask,
@@ -844,24 +1159,42 @@ def main():
         yc_test,
     ) = test_arrays
 
-    # ------------------------------------------------------------------
-    # Fit scalers ONLY on training data
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # CLASS WEIGHTS
+    # ==================================================================
+
+    drought_class_weights, heat_class_weights = (
+        compute_class_weights(
+            yc_tr,
+            n_classes=4,
+        )
+    )
+
+    # ==================================================================
+    # FIT SCALERS ON TRAINING DATA ONLY
+    # ==================================================================
 
     print()
-    print("Fitting training-only scalers...")
+    print(
+        "Fitting training-only scalers..."
+    )
 
     scalers = fit_all_scalers(
         Xm_tr,
         Xv_tr,
         Xe_tr,
         yr_tr,
-        scaler_dir="data/processed/scalers",
+        scaler_dir=PROJECT_ROOT / "data/processed/scalers",
     )
 
-    # ------------------------------------------------------------------
-    # Apply scalers
-    # ------------------------------------------------------------------
+    print(
+        "Scalers saved to: "
+        f"{PROJECT_ROOT / 'data/processed/scalers'}"
+    )
+
+    # ==================================================================
+    # APPLY INPUT SCALERS
+    # ==================================================================
 
     Xm_tr = apply_scaler_3d(
         Xm_tr,
@@ -908,9 +1241,25 @@ def main():
         scalers["eng"],
     )
 
-    # ------------------------------------------------------------------
-    # Build loaders
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # SCALE REGRESSION TARGETS
+    # ==================================================================
+
+    yr_tr = scalers["reg"].transform(
+        yr_tr
+    ).astype(np.float32)
+
+    yr_val = scalers["reg"].transform(
+        yr_val
+    ).astype(np.float32)
+
+    yr_test = scalers["reg"].transform(
+        yr_test
+    ).astype(np.float32)
+
+    # ==================================================================
+    # BUILD LOADERS
+    # ==================================================================
 
     scaled_splits = {
         "train": (
@@ -945,12 +1294,14 @@ def main():
         batch_size=batch_size,
     )
 
-    # ------------------------------------------------------------------
-    # Build model
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # BUILD MODEL
+    # ==================================================================
 
     print()
-    print("Building BiLSTM + Attention model...")
+    print(
+        "Building BiLSTM + Attention model..."
+    )
 
     model = BiLSTMForecastModel(
         met_dim=len(met_cols),
@@ -960,10 +1311,10 @@ def main():
         d_k=d_k,
         num_heads=num_heads,
         gate_hidden=gate_hidden,
-        fusion_dropout=dropout,
-        lstm_hidden=128,
+        fusion_dropout=0.20,
+        lstm_hidden=64,
         lstm_layers=1,
-        head_dropout=dropout,
+        head_dropout=0.30,
     ).to(device)
 
     total_parameters = sum(
@@ -977,20 +1328,42 @@ def main():
         f"{total_parameters:,}"
     )
 
-    # ------------------------------------------------------------------
-    # Loss
-    # ------------------------------------------------------------------
+    print(
+        "DEBUG 1: Model construction complete",
+        flush=True,
+    )
+
+    # ==================================================================
+    # LOSS
+    # ==================================================================
+
     loss_weights = config["model"]["loss_weights"]
 
+    print(
+        f"DEBUG 2: Loss weights loaded: "
+        f"{loss_weights}",
+        flush=True,
+    )
+
+    # IMPORTANT:
+    # The dynamically calculated training-only class weights
+    # are passed here.
     criterion = MultiTaskLoss(
         regression_weight=loss_weights["regression"],
         drought_weight=loss_weights["drought"],
         heat_weight=loss_weights["heat"],
+        drought_class_weights=drought_class_weights.to(device),
+        heat_class_weights=heat_class_weights.to(device),
     ).to(device)
 
-    # ------------------------------------------------------------------
-    # Optimizer
-    # ------------------------------------------------------------------
+    print(
+        "DEBUG 3: Criterion created",
+        flush=True,
+    )
+
+    # ==================================================================
+    # OPTIMIZER
+    # ==================================================================
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -998,9 +1371,14 @@ def main():
         weight_decay=1e-4,
     )
 
-    # ------------------------------------------------------------------
-    # Learning-rate scheduler
-    # ------------------------------------------------------------------
+    print(
+        "DEBUG 4: Optimizer created",
+        flush=True,
+    )
+
+    # ==================================================================
+    # LEARNING-RATE SCHEDULER
+    # ==================================================================
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -1010,9 +1388,14 @@ def main():
         min_lr=1e-6,
     )
 
-    # ------------------------------------------------------------------
-    # Training history
-    # ------------------------------------------------------------------
+    print(
+        "DEBUG 5: Scheduler created",
+        flush=True,
+    )
+
+    # ==================================================================
+    # TRAINING HISTORY
+    # ==================================================================
 
     history = {
         "train_total": [],
@@ -1026,29 +1409,54 @@ def main():
         "learning_rate": [],
     }
 
-    # ------------------------------------------------------------------
-    # Early stopping
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # EARLY STOPPING
+    # ==================================================================
 
     best_val_loss = float("inf")
+
     best_epoch = 0
+
     epochs_without_improvement = 0
+
+    checkpoint_dir = (
+        PROJECT_ROOT / checkpoint_dir
+        if not checkpoint_dir.is_absolute()
+        else checkpoint_dir
+    )
+
+    checkpoint_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     best_checkpoint = (
         checkpoint_dir
         / "bilstm_attention_best.pt"
     )
 
-    # ------------------------------------------------------------------
-    # TRAIN
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # START TRAINING
+    # ==================================================================
 
     print()
     print("=" * 78)
     print("STARTING TRAINING")
     print("=" * 78)
 
-    for epoch in range(1, epochs + 1):
+    print(
+        "DEBUG 6: About to enter training loop",
+        flush=True,
+    )
+
+    for epoch in range(
+        1,
+        epochs + 1,
+    ):
+
+        # --------------------------------------------------------------
+        # Training
+        # --------------------------------------------------------------
 
         train_losses = train_one_epoch(
             model=model,
@@ -1058,12 +1466,20 @@ def main():
             device=device,
         )
 
+        # --------------------------------------------------------------
+        # Validation
+        # --------------------------------------------------------------
+
         val_losses = validate_one_epoch(
             model=model,
             loader=val_loader,
             criterion=criterion,
             device=device,
         )
+
+        # --------------------------------------------------------------
+        # Scheduler
+        # --------------------------------------------------------------
 
         scheduler.step(
             val_losses["total"]
@@ -1117,12 +1533,19 @@ def main():
 
         print(
             f"Epoch {epoch:03d}/{epochs:03d} | "
-            f"Train Loss: {train_losses['total']:.5f} | "
-            f"Val Loss: {val_losses['total']:.5f} | "
-            f"Reg: {val_losses['regression']:.5f} | "
-            f"Drought: {val_losses['drought']:.5f} | "
-            f"Heat: {val_losses['heat']:.5f} | "
-            f"LR: {current_lr:.2e}"
+            f"Train Loss: "
+            f"{train_losses['total']:.5f} | "
+            f"Val Loss: "
+            f"{val_losses['total']:.5f} | "
+            f"Reg: "
+            f"{val_losses['regression']:.5f} | "
+            f"Drought: "
+            f"{val_losses['drought']:.5f} | "
+            f"Heat: "
+            f"{val_losses['heat']:.5f} | "
+            f"LR: "
+            f"{current_lr:.2e}",
+            flush=True,
         )
 
         # --------------------------------------------------------------
@@ -1148,7 +1571,8 @@ def main():
 
             print(
                 f"  ✓ New best model saved "
-                f"(epoch {epoch})"
+                f"(epoch {epoch})",
+                flush=True,
             )
 
         else:
@@ -1159,29 +1583,32 @@ def main():
         # Early stopping
         # --------------------------------------------------------------
 
-        if epochs_without_improvement >= patience:
+        if (
+            epochs_without_improvement
+            >= patience
+        ):
 
             print()
+
             print(
-                f"Early stopping triggered after "
-                f"{epoch} epochs."
+                f"Early stopping triggered "
+                f"after {epoch} epochs."
             )
 
             break
 
-    # ------------------------------------------------------------------
-    # Save training history
-    # ------------------------------------------------------------------
-
-    history_dir = checkpoint_dir
-    history_dir.mkdir(parents=True, exist_ok=True)
+    # ==================================================================
+    # SAVE TRAINING HISTORY
+    # ==================================================================
 
     history_path = (
-        history_dir
+        checkpoint_dir
         / "bilstm_attention_history.csv"
     )
 
-    history_df = pd.DataFrame(history)
+    history_df = pd.DataFrame(
+        history
+    )
 
     history_df.insert(
         0,
@@ -1197,12 +1624,22 @@ def main():
         index=False,
     )
 
-    # ------------------------------------------------------------------
-    # Load best model
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # LOAD BEST MODEL
+    # ==================================================================
 
     print()
-    print("Loading best checkpoint...")
+    print(
+        "Loading best checkpoint..."
+    )
+
+    if not best_checkpoint.exists():
+
+        raise FileNotFoundError(
+            "Best checkpoint was not created. "
+            "Training may have failed before the "
+            "first validation epoch."
+        )
 
     checkpoint = torch.load(
         best_checkpoint,
@@ -1213,9 +1650,9 @@ def main():
         checkpoint["model_state_dict"]
     )
 
-    # ------------------------------------------------------------------
-    # Final summary
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # FINAL SUMMARY
+    # ==================================================================
 
     print()
     print("=" * 78)
@@ -1239,11 +1676,18 @@ def main():
     )
 
     print("=" * 78)
+
     print()
+
     print(
-        "Next step: run evaluate_bilstm.py on the held-out "
-        "2025-2026 test set."
+        "Next step: run evaluate_bilstm.py "
+        "on the held-out 2025-2026 test set."
     )
+
+
+# ======================================================================
+# ENTRY POINT
+# ======================================================================
 
 
 if __name__ == "__main__":

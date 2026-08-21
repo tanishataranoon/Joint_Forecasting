@@ -143,9 +143,7 @@ class BiLSTMAttentionBackbone(nn.Module):
         # Temporal attention pooling
         # ---------------------------------------------------------
 
-        self.pool = TemporalAttentionPool(
-            hidden_dim=self.out_dim
-        )
+        self.pool = TemporalAttentionPool(hidden_dim=self.out_dim)
 
     def forward(self, F: torch.Tensor):
         """
